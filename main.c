@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 
 #define INPUT_NODES 784  // 28*28 pixels
 #define HIDDEN_NODES 256 // Number of hidden nodes
@@ -330,6 +331,8 @@ void load_weights_biases(char *file_name)
 
 int main()
 {
+    clock_t start, end;
+    float seconds;
     // Initialize weights and biases with small random values
     for (int i = 0; i < INPUT_NODES; i++)
     {
@@ -356,6 +359,8 @@ int main()
     // load_weights_biases("model.bin");
 
     // // Train the network
+    start = clock();
+
     for (int epoch = 0; epoch < NUMBER_OF_EPOCHS; epoch++)
     {
         forward_prob_output = 0; // Reset correct predictions
@@ -368,16 +373,32 @@ int main()
         printf("Example weight: %lf\n", weight1[0][0]);
     }
 
+    end = clock();
+
+    seconds = (float)(end - start) / CLOCKS_PER_SEC;
+
+    printf("Time to test: %f\n", seconds);
+
     save_weights_biases("model.bin");
     
 
     // Test the network
+
+    start = clock();
+
     correct_predictions = 0;
     for (int i = 0; i < NUM_TEST_IMAGES; i++)
     {
         int correct_label = max_index(test_labels[i], OUTPUT_NODES);
         test(test_images[i], weight1, weight2, bias1, bias2, correct_label);
     }
+
+    end = clock();
+
+    seconds = (float)(end - start) / CLOCKS_PER_SEC;
+
+    printf("Time to train: %f\n", seconds);
+
     printf("Testing Accuracy: %f\n", (double)correct_predictions / NUM_TEST_IMAGES);
 
     return 0;
