@@ -357,6 +357,7 @@ int main()
 {
     clock_t start, end;
     float seconds;
+    int threadNumber = 2;
     // Initialize weights and biases with small random values
     for (int i = 0; i < INPUT_NODES; i++)
     {
@@ -391,7 +392,7 @@ int main()
         for (int i = 0; i < NUM_TRAINING_IMAGES; i++)
         {
             int correct_label = max_index(training_labels[i], OUTPUT_NODES);
-            train(training_images[i], training_labels[i], weight1, weight2, bias1, bias2, correct_label, epoch, 4);
+            train(training_images[i], training_labels[i], weight1, weight2, bias1, bias2, correct_label, epoch, threadNumber);
         }
         printf("Epoch %d : Training Accuracy: %lf\n", epoch, (double)forward_prob_output / NUM_TRAINING_IMAGES);
         printf("Example weight: %lf\n", weight1[0][0]);
@@ -400,6 +401,8 @@ int main()
     end = clock();
 
     seconds = (float)(end - start) / CLOCKS_PER_SEC;
+
+    seconds /= threadNumber;
 
     printf("Time to train: %f\n", seconds);
 

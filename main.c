@@ -377,7 +377,7 @@ int main()
 
     seconds = (float)(end - start) / CLOCKS_PER_SEC;
 
-    printf("Time to test: %f\n", seconds);
+    printf("Time to train: %f\n", seconds);
 
     save_weights_biases("model.bin");
     
@@ -397,7 +397,7 @@ int main()
 
     seconds = (float)(end - start) / CLOCKS_PER_SEC;
 
-    printf("Time to train: %f\n", seconds);
+    printf("Time to test: %f\n", seconds);
 
     printf("Testing Accuracy: %f\n", (double)correct_predictions / NUM_TEST_IMAGES);
 
