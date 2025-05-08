@@ -3,6 +3,7 @@
 #include <math.h>
 #include <omp.h>
 #include <time.h>
+#include <string.h>
 
 #define INPUT_NODES 784  // 28*28 pixels
 #define HIDDEN_NODES 256 // Number of hidden nodes
@@ -13,20 +14,25 @@
 
 #define NUMBER_OF_EPOCHS 10
 
-double training_images[NUM_TRAINING_IMAGES][INPUT_NODES];
-double training_labels[NUM_TRAINING_IMAGES][OUTPUT_NODES];
-double test_images[NUM_TEST_IMAGES][INPUT_NODES];
-double test_labels[NUM_TEST_IMAGES][OUTPUT_NODES];
+// Alinhamento de memória para melhor desempenho de cache
+__attribute__((aligned(64))) double training_images[NUM_TRAINING_IMAGES][INPUT_NODES];
+__attribute__((aligned(64))) double training_labels[NUM_TRAINING_IMAGES][OUTPUT_NODES];
+__attribute__((aligned(64))) double test_images[NUM_TEST_IMAGES][INPUT_NODES];
+__attribute__((aligned(64))) double test_labels[NUM_TEST_IMAGES][OUTPUT_NODES];
 
-// Initialize weights and biases
-double weight1[INPUT_NODES][HIDDEN_NODES];
-double weight2[HIDDEN_NODES][OUTPUT_NODES];
-double bias1[HIDDEN_NODES];
-double bias2[OUTPUT_NODES];
+// Pesos e bias alinhados para melhor desempenho
+__attribute__((aligned(64))) double weight1[INPUT_NODES][HIDDEN_NODES];
+__attribute__((aligned(64))) double weight2[HIDDEN_NODES][OUTPUT_NODES];
+__attribute__((aligned(64))) double bias1[HIDDEN_NODES];
+__attribute__((aligned(64))) double bias2[OUTPUT_NODES];
 
-// Variável atômica para contar predições corretas
+// Variáveis para contagem
 int correct_predictions;
 int forward_prob_output;
+
+// Define o número de threads que oferece o melhor desempenho no Q6600
+// 3 threads podem ser melhores que 4 para reduzir contenção de memória
+#define OMP_THREAD_COUNT 3
 
 void load_mnist()
 {
@@ -102,7 +108,6 @@ void load_mnist()
     }
 
     // Read the test images
-
     for (int i = 0; i < 8; i++)
     {
         fread(&t, sizeof(unsigned char), 1, test_images_file);
@@ -119,7 +124,6 @@ void load_mnist()
     }
 
     // Read the test labels
-
     for (int i = 0; i < 8; i++)
     {
         fread(&t, sizeof(unsigned char), 1, test_labels_file);
@@ -149,12 +153,13 @@ void load_mnist()
     fclose(test_labels_file);
 }
 
-double sigmoid(double x)
+// Utilizar funções inline para operações simples
+static inline double sigmoid(double x)
 {
     return 1.0 / (1.0 + exp(-x));
 }
 
-double reLU(double x)
+static inline double reLU(double x)
 {
     return x > 0.0 ? x : 0.0;
 }
@@ -172,6 +177,7 @@ int max_index(double arr[], int size)
     return max_i;
 }
 
+// Versão otimizada da função de treino
 void train(
     double input[INPUT_NODES],
     double target[OUTPUT_NODES],
@@ -182,112 +188,128 @@ void train(
     int correct_label,
     int epoch)
 {
-    double hidden[HIDDEN_NODES];
-    double output_layer[OUTPUT_NODES];
-    double delta_out[OUTPUT_NODES];
-    double delta_hidden[HIDDEN_NODES];
-
-    // 1) Feedforward - Paralelizando os loops com OpenMP
+    // Alocação na pilha em vez do heap para melhor desempenho de cache
+    double hidden[HIDDEN_NODES] __attribute__((aligned(64)));
+    double output_layer[OUTPUT_NODES] __attribute__((aligned(64)));
+    double delta_out[OUTPUT_NODES] __attribute__((aligned(64)));
+    double delta_hidden[HIDDEN_NODES] __attribute__((aligned(64)));
+    
+    // Calcular taxa de aprendizado uma única vez
+    double lr = 0.1;
+    if (epoch % 5 == 0 && epoch > 0)
+    {
+        lr *= 0.5;
+    }
+    
+    // Fase forward - paralelizar apenas blocos computacionalmente intensivos
+    // Usando uma única região paralela para reduzir overhead de criação de threads
     #pragma omp parallel
     {
-        // Primeira camada: entrada -> camada oculta
-        #pragma omp for
+        // Primeira camada
+        #pragma omp for schedule(guided, 16) nowait
         for (int i = 0; i < HIDDEN_NODES; i++)
         {
             double sum = bias1[i];
-            for (int j = 0; j < INPUT_NODES; j++)
+            // Loop interno desenrolado para melhor uso de pipelines
+            for (int j = 0; j < INPUT_NODES; j += 4)
+            {
                 sum += input[j] * weight1[j][i];
+                if (j+1 < INPUT_NODES) sum += input[j+1] * weight1[j+1][i];
+                if (j+2 < INPUT_NODES) sum += input[j+2] * weight1[j+2][i];
+                if (j+3 < INPUT_NODES) sum += input[j+3] * weight1[j+3][i];
+            }
             hidden[i] = reLU(sum);
         }
 
-        // Segunda camada: camada oculta -> saída
-        #pragma omp for
+        // Segunda camada
+        #pragma omp for schedule(guided, 4) nowait
         for (int i = 0; i < OUTPUT_NODES; i++)
         {
             double sum = bias2[i];
-            for (int j = 0; j < HIDDEN_NODES; j++)
+            // Loop similar desenrolado, mas menos, já que HIDDEN_NODES não é tão grande
+            for (int j = 0; j < HIDDEN_NODES; j += 2)
+            {
                 sum += hidden[j] * weight2[j][i];
+                if (j+1 < HIDDEN_NODES) sum += hidden[j+1] * weight2[j+1][i];
+            }
             output_layer[i] = sigmoid(sum);
         }
+        
+        // Sem barreira no final da região paralela para permitir sobreposição
     }
 
-    // Controle de acurácia - Usando atomic para evitar condição de corrida
+    // Parte sequencial (baixo custo computacional, não compensa paralelizar)
     int prediction = max_index(output_layer, OUTPUT_NODES);
-    #pragma omp atomic
-    forward_prob_output += (prediction == correct_label);
+    if (prediction == correct_label)
+        forward_prob_output++;
 
-    // 2) Backpropagation deltas - Paralelizando cálculos dos deltas
+    // Backpropagation deltas - paralelizando apenas onde necessário
     #pragma omp parallel
     {
-        // Cálculo dos deltas de saída
-        #pragma omp for
+        // Calcular deltas de saída
+        #pragma omp for schedule(static) nowait
         for (int i = 0; i < OUTPUT_NODES; i++)
         {
             double a = output_layer[i];
             delta_out[i] = (a - target[i]) * a * (1.0 - a);
         }
 
-        // Cálculo dos deltas da camada oculta
-        #pragma omp for
+        // Calcular deltas da camada oculta - uso mais intensivo
+        #pragma omp for schedule(guided, 16)
         for (int i = 0; i < HIDDEN_NODES; i++)
         {
             double sum = 0.0;
             for (int j = 0; j < OUTPUT_NODES; j++)
+            {
                 sum += delta_out[j] * weight2[i][j];
+            }
             delta_hidden[i] = sum * (hidden[i] > 0.0 ? 1.0 : 0.0);
         }
     }
 
-    // 3) Atualização dos pesos e bias
-    double lr = 0.1;
-    if (epoch % 5 == 0 && epoch > 0)
+    // Atualização de pesos - parte mais intensiva computacionalmente
+    // Paralelizamos em blocos separados para otimizar o equilíbrio de carga
+    
+    // Atualização de pesos hidden -> output (parte menor, mais leve)
+    #pragma omp parallel for schedule(guided, 8)
+    for (int i = 0; i < HIDDEN_NODES; i++)
     {
-        lr *= 0.5;
-    }
-
-    // Usando OpenMP para paralelizar a atualização dos pesos
-    #pragma omp parallel
-    {
-        // (a) Pesos e bias de camada oculta -> saída
-        #pragma omp for collapse(2)
-        for (int i = 0; i < HIDDEN_NODES; i++)
-        {
-            for (int j = 0; j < OUTPUT_NODES; j++)
-            {
-                weight2[i][j] -= lr * delta_out[j] * hidden[i];
-            }
-        }
-
-        #pragma omp for
         for (int j = 0; j < OUTPUT_NODES; j++)
         {
-            bias2[j] -= lr * delta_out[j];
+            weight2[i][j] -= lr * delta_out[j] * hidden[i];
         }
+    }
 
-        // (b) Pesos e bias de entrada -> camada oculta
-        #pragma omp for collapse(2)
-        for (int i = 0; i < INPUT_NODES; i++)
-        {
-            for (int j = 0; j < HIDDEN_NODES; j++)
-            {
-                weight1[i][j] -= lr * delta_hidden[j] * input[i];
-            }
-        }
+    // Atualização de bias de saída (muito pequeno, baixa granularidade)
+    for (int j = 0; j < OUTPUT_NODES; j++)
+    {
+        bias2[j] -= lr * delta_out[j];
+    }
 
-        #pragma omp for
+    // Atualização de pesos input -> hidden (parte maior, mais pesada)
+    #pragma omp parallel for schedule(guided, 32)
+    for (int i = 0; i < INPUT_NODES; i++)
+    {
         for (int j = 0; j < HIDDEN_NODES; j++)
         {
-            bias1[j] -= lr * delta_hidden[j];
+            weight1[i][j] -= lr * delta_hidden[j] * input[i];
         }
+    }
+
+    // Atualização de bias da camada oculta
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < HIDDEN_NODES; j++)
+    {
+        bias1[j] -= lr * delta_hidden[j];
     }
 }
 
 void test(double input[INPUT_NODES], double weight1[INPUT_NODES][HIDDEN_NODES], double weight2[HIDDEN_NODES][OUTPUT_NODES], double bias1[HIDDEN_NODES], double bias2[OUTPUT_NODES], int correct_label)
 {
-    double hidden[HIDDEN_NODES];
-    double output_layer[OUTPUT_NODES];
+    double hidden[HIDDEN_NODES] __attribute__((aligned(64)));
+    double output_layer[OUTPUT_NODES] __attribute__((aligned(64)));
 
-    // Feedforward
+    // Feedforward sem paralelização, pois é chamado em um loop já paralelizado
     for (int i = 0; i < HIDDEN_NODES; i++)
     {
         double sum = bias1[i];
@@ -348,93 +370,96 @@ void load_weights_biases(char *file_name)
 
 int main()
 {
-    double start, end;
+    clock_t start, end;
     double seconds;
     
-    // Definir número de threads (pode ser ajustado conforme a CPU)
-    int num_threads = omp_get_max_threads();
-    printf("Usando %d threads OpenMP\n", num_threads);
-    omp_set_num_threads(num_threads);
+    // Configure afinidade de processos/threads - importante para processadores de geração antiga
+    #ifdef _OPENMP
+    // Definir número fixo de threads para evitar overhead de criação/destruição
+    omp_set_num_threads(OMP_THREAD_COUNT);
     
+    // Definir afinidade de threads para processador Q6600
+    #ifdef __linux__
+    putenv("OMP_PROC_BIND=close");
+    putenv("OMP_PLACES=cores");
+    #endif
+    
+    printf("Usando OpenMP com %d threads\n", OMP_THREAD_COUNT);
+    #endif
+
+    // Seed para geração de números aleatórios
     srand(time(NULL));
 
-    // Inicializar pesos e bias com valores aleatórios pequenos
-    #pragma omp parallel for collapse(2)
+    // Inicializar pesos e bias
+    // Não paralelizamos essa parte, pois só é executada uma vez e o overhead supera o ganho
     for (int i = 0; i < INPUT_NODES; i++)
     {
         for (int j = 0; j < HIDDEN_NODES; j++)
         {
-            weight1[i][j] = (double)rand() / RAND_MAX * 0.1 - 0.05;
+            weight1[i][j] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
         }
     }
-
-    #pragma omp parallel
+    
+    for (int i = 0; i < HIDDEN_NODES; i++)
     {
-        #pragma omp for
-        for (int i = 0; i < HIDDEN_NODES; i++)
+        bias1[i] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
+        for (int j = 0; j < OUTPUT_NODES; j++)
         {
-            bias1[i] = (double)rand() / RAND_MAX * 0.1 - 0.05;
+            weight2[i][j] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
         }
-        
-        #pragma omp for collapse(2)
-        for (int i = 0; i < HIDDEN_NODES; i++)
-        {
-            for (int j = 0; j < OUTPUT_NODES; j++)
-            {
-                weight2[i][j] = (double)rand() / RAND_MAX * 0.1 - 0.05;
-            }
-        }
-        
-        #pragma omp for
-        for (int i = 0; i < OUTPUT_NODES; i++)
-        {
-            bias2[i] = (double)rand() / RAND_MAX * 0.1 - 0.05;
-        }
+    }
+    
+    for (int i = 0; i < OUTPUT_NODES; i++)
+    {
+        bias2[i] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
     }
 
     // Carregar o dataset MNIST
     load_mnist();
     
-    // Treinar a rede
-    start = omp_get_wtime(); // Usando temporizador de precisão do OpenMP
+    // TREINAMENTO
+    printf("Iniciando treinamento...\n");
+    start = clock();
     
     for (int epoch = 0; epoch < NUMBER_OF_EPOCHS; epoch++)
     {
-        forward_prob_output = 0; // Reiniciar contagem de previsões corretas
+        forward_prob_output = 0;
         
-        // Paralelizar o loop de treinamento por imagens
-        #pragma omp parallel for schedule(dynamic)
+        // Importante: usar schedule(dynamic, batch_size) para melhor balanceamento
+        // O tamanho do batch (20) foi escolhido para balancear granularidade e overhead
+        #pragma omp parallel for schedule(dynamic, 20)
         for (int i = 0; i < NUM_TRAINING_IMAGES; i++)
         {
             int correct_label = max_index(training_labels[i], OUTPUT_NODES);
-            // Note que não passamos num_threads para a função train, pois já configuramos no início
             train(training_images[i], training_labels[i], weight1, weight2, bias1, bias2, correct_label, epoch);
         }
         
-        printf("Epoch %d : Training Accuracy: %lf\n", epoch, (double)forward_prob_output / NUM_TRAINING_IMAGES);
+        printf("Epoch %d: Training Accuracy: %lf\n", epoch, (double)forward_prob_output / NUM_TRAINING_IMAGES);
         printf("Example weight: %lf\n", weight1[0][0]);
     }
 
-    end = omp_get_wtime();
-    seconds = end - start;
-    printf("Time to train: %f seconds\n", seconds);
+    end = clock();
+    seconds = (double)(end - start) / CLOCKS_PER_SEC;
+    printf("Time to train: %f s\n", seconds);
 
-    save_weights_biases("model_omp.bin");
+    // Salvar modelo
+    save_weights_biases("model_omp_optimized.bin");
     
-    // Testar a rede
-    start = omp_get_wtime();
+    // TESTE
+    printf("Iniciando teste...\n");
+    start = clock();
     correct_predictions = 0;
     
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(dynamic, 20)
     for (int i = 0; i < NUM_TEST_IMAGES; i++)
     {
         int correct_label = max_index(test_labels[i], OUTPUT_NODES);
         test(test_images[i], weight1, weight2, bias1, bias2, correct_label);
     }
 
-    end = omp_get_wtime();
-    seconds = end - start;
-    printf("Time to test: %f seconds\n", seconds);
+    end = clock();
+    seconds = (double)(end - start) / CLOCKS_PER_SEC;
+    printf("Time to test: %f s\n", seconds);
     printf("Testing Accuracy: %f\n", (double)correct_predictions / NUM_TEST_IMAGES);
 
     return 0;
