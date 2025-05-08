@@ -4,9 +4,9 @@ omp:
 	gcc8 -O3 -o omp -lm main_omp_optimized.c -fopenmp -march=native -mtune=native
 mpi:
 	mpicc -o mpi -lm main_mpi.c -fopenmp -O3 -march=native -mtune=native
-	
-mpi_openmp_optimized:
-	mpicc -o mpi_openmp_optimized -lm main_mpi_openmp_optimized.c -fopenmp -O3 -march=native -mtune=native
+
+mpi_optimized:
+	mpicc -o mpi_optimized -lm main_mpi_optimized.c -fopenmp -O3 -march=native -mtune=native
 run_sequential:
 	sh -c "time ./sequential"
 run_omp:
