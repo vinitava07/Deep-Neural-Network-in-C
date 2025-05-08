@@ -3,6 +3,7 @@ main_omp_improved
 model.bin
 model_mpi_omp.bin
 model_omp.bin
+model_omp_optimized.bin
 omp
 mpi
 sequential
