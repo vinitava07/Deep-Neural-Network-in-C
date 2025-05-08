@@ -30,10 +30,6 @@ __attribute__((aligned(64))) double bias2[OUTPUT_NODES];
 int correct_predictions;
 int forward_prob_output;
 
-// Define o número de threads que oferece o melhor desempenho no Q6600
-// 3 threads podem ser melhores que 4 para reduzir contenção de memória
-#define OMP_THREAD_COUNT 3
-
 void load_mnist()
 {
     // Open the training images file
@@ -193,14 +189,14 @@ void train(
     double output_layer[OUTPUT_NODES] __attribute__((aligned(64)));
     double delta_out[OUTPUT_NODES] __attribute__((aligned(64)));
     double delta_hidden[HIDDEN_NODES] __attribute__((aligned(64)));
-    
+
     // Calcular taxa de aprendizado uma única vez
     double lr = 0.1;
     if (epoch % 5 == 0 && epoch > 0)
     {
         lr *= 0.5;
     }
-    
+
     // Fase forward - paralelizar apenas blocos computacionalmente intensivos
     // Usando uma única região paralela para reduzir overhead de criação de threads
     #pragma omp parallel
@@ -234,7 +230,7 @@ void train(
             }
             output_layer[i] = sigmoid(sum);
         }
-        
+
         // Sem barreira no final da região paralela para permitir sobreposição
     }
 
@@ -269,7 +265,7 @@ void train(
 
     // Atualização de pesos - parte mais intensiva computacionalmente
     // Paralelizamos em blocos separados para otimizar o equilíbrio de carga
-    
+
     // Atualização de pesos hidden -> output (parte menor, mais leve)
     #pragma omp parallel for schedule(guided, 8)
     for (int i = 0; i < HIDDEN_NODES; i++)
@@ -372,95 +368,96 @@ int main()
 {
     clock_t start, end;
     double seconds;
-    
-    // Configure afinidade de processos/threads - importante para processadores de geração antiga
-    #ifdef _OPENMP
-    // Definir número fixo de threads para evitar overhead de criação/destruição
-    omp_set_num_threads(OMP_THREAD_COUNT);
-    
-    // Definir afinidade de threads para processador Q6600
-    #ifdef __linux__
-    putenv("OMP_PROC_BIND=close");
-    putenv("OMP_PLACES=cores");
-    #endif
-    
-    printf("Usando OpenMP com %d threads\n", OMP_THREAD_COUNT);
-    #endif
 
-    // Seed para geração de números aleatórios
-    srand(time(NULL));
+    for(int tNumber = 2; tNumber <= 8; tNumber*=2){
+        // Configure afinidade de processos/threads - importante para processadores de geração antiga
+        #ifdef _OPENMP
+        // Definir número fixo de threads para evitar overhead de criação/destruição
+        omp_set_num_threads(tNumber);
 
-    // Inicializar pesos e bias
-    // Não paralelizamos essa parte, pois só é executada uma vez e o overhead supera o ganho
-    for (int i = 0; i < INPUT_NODES; i++)
-    {
-        for (int j = 0; j < HIDDEN_NODES; j++)
+        // Definir afinidade de threads para processador Q6600
+        #ifdef __linux__
+        putenv("OMP_PROC_BIND=close");
+        putenv("OMP_PLACES=cores");
+        #endif
+
+        printf("Usando OpenMP com %d threads\n", tNumber);
+        #endif
+
+        // Seed para geração de números aleatórios
+        srand(time(NULL));
+
+        // Inicializar pesos e bias
+        // Não paralelizamos essa parte, pois só é executada uma vez e o overhead supera o ganho
+        for (int i = 0; i < INPUT_NODES; i++)
         {
-            weight1[i][j] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
+            for (int j = 0; j < HIDDEN_NODES; j++)
+            {
+                weight1[i][j] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
+            }
         }
-    }
-    
-    for (int i = 0; i < HIDDEN_NODES; i++)
-    {
-        bias1[i] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
-        for (int j = 0; j < OUTPUT_NODES; j++)
-        {
-            weight2[i][j] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
-        }
-    }
-    
-    for (int i = 0; i < OUTPUT_NODES; i++)
-    {
-        bias2[i] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
-    }
 
-    // Carregar o dataset MNIST
-    load_mnist();
-    
-    // TREINAMENTO
-    printf("Iniciando treinamento...\n");
-    start = clock();
-    
-    for (int epoch = 0; epoch < NUMBER_OF_EPOCHS; epoch++)
-    {
-        forward_prob_output = 0;
-        
-        // Importante: usar schedule(dynamic, batch_size) para melhor balanceamento
-        // O tamanho do batch (20) foi escolhido para balancear granularidade e overhead
+        for (int i = 0; i < HIDDEN_NODES; i++)
+        {
+            bias1[i] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
+            for (int j = 0; j < OUTPUT_NODES; j++)
+            {
+                weight2[i][j] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
+            }
+        }
+
+        for (int i = 0; i < OUTPUT_NODES; i++)
+        {
+            bias2[i] = ((double)rand() / RAND_MAX * 0.1) - 0.05;
+        }
+
+        // Carregar o dataset MNIST
+        load_mnist();
+
+        // TREINAMENTO
+        printf("Iniciando treinamento...\n");
+        start = clock();
+
+        for (int epoch = 0; epoch < NUMBER_OF_EPOCHS; epoch++)
+        {
+            forward_prob_output = 0;
+
+            // Importante: usar schedule(dynamic, batch_size) para melhor balanceamento
+            // O tamanho do batch (20) foi escolhido para balancear granularidade e overhead
+            #pragma omp parallel for schedule(dynamic, 20)
+            for (int i = 0; i < NUM_TRAINING_IMAGES; i++)
+            {
+                int correct_label = max_index(training_labels[i], OUTPUT_NODES);
+                train(training_images[i], training_labels[i], weight1, weight2, bias1, bias2, correct_label, epoch);
+            }
+
+            printf("Epoch %d: Training Accuracy: %lf\n", epoch, (double)forward_prob_output / NUM_TRAINING_IMAGES);
+            printf("Example weight: %lf\n", weight1[0][0]);
+        }
+
+        end = clock();
+        seconds = ((double)(end - start) / CLOCKS_PER_SEC) / tNumber;
+        printf("Time to train: %f s\n", seconds);
+
+        // Salvar modelo
+        save_weights_biases("model_omp_optimized.bin");
+
+        // TESTE
+        printf("Iniciando teste...\n");
+        start = clock();
+        correct_predictions = 0;
+
         #pragma omp parallel for schedule(dynamic, 20)
-        for (int i = 0; i < NUM_TRAINING_IMAGES; i++)
+        for (int i = 0; i < NUM_TEST_IMAGES; i++)
         {
-            int correct_label = max_index(training_labels[i], OUTPUT_NODES);
-            train(training_images[i], training_labels[i], weight1, weight2, bias1, bias2, correct_label, epoch);
+            int correct_label = max_index(test_labels[i], OUTPUT_NODES);
+            test(test_images[i], weight1, weight2, bias1, bias2, correct_label);
         }
-        
-        printf("Epoch %d: Training Accuracy: %lf\n", epoch, (double)forward_prob_output / NUM_TRAINING_IMAGES);
-        printf("Example weight: %lf\n", weight1[0][0]);
+
+        end = clock();
+        seconds = ((double)(end - start) / CLOCKS_PER_SEC) / tNumber;
+        printf("Time to test: %f s\n", seconds);
+        printf("Testing Accuracy: %f\n", (double)correct_predictions / NUM_TEST_IMAGES);
     }
-
-    end = clock();
-    seconds = (double)(end - start) / CLOCKS_PER_SEC;
-    printf("Time to train: %f s\n", seconds);
-
-    // Salvar modelo
-    save_weights_biases("model_omp_optimized.bin");
-    
-    // TESTE
-    printf("Iniciando teste...\n");
-    start = clock();
-    correct_predictions = 0;
-    
-    #pragma omp parallel for schedule(dynamic, 20)
-    for (int i = 0; i < NUM_TEST_IMAGES; i++)
-    {
-        int correct_label = max_index(test_labels[i], OUTPUT_NODES);
-        test(test_images[i], weight1, weight2, bias1, bias2, correct_label);
-    }
-
-    end = clock();
-    seconds = (double)(end - start) / CLOCKS_PER_SEC;
-    printf("Time to test: %f s\n", seconds);
-    printf("Testing Accuracy: %f\n", (double)correct_predictions / NUM_TEST_IMAGES);
-
     return 0;
 }
