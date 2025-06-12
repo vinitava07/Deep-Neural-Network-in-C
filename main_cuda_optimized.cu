@@ -371,23 +371,7 @@ void load_mnist() {
     printf("Dataset MNIST carregado com sucesso\n");
 }
 int main() {
-    printf("CUDA Otimizado - Processamento em Mini-batches\n");
-    printf("Compilado para GT 1030 (arquitetura Pascal sm_61)\n");
-
-    // Verificar propriedades da GPU
-    int deviceCount;
-    cudaGetDeviceCount(&deviceCount);
-    if (deviceCount == 0) {
-        printf("Nenhuma GPU CUDA encontrada!\n");
-        return 1;
-    }
-
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    printf("GPU detectada: %s\n", prop.name);
-    printf("Compute capability: %d.%d\n", prop.major, prop.minor);
-    printf("Multiprocessadores: %d\n", prop.multiProcessorCount);
-    printf("\n");
+    printf("CUDA - Processamento em Mini-batches\n");
 
     // Carregar dados MNIST
     load_mnist();

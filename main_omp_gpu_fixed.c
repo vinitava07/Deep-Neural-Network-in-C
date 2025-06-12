@@ -1,60 +1,29 @@
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>   // memcpy
 #include <math.h>
 #include <omp.h>
-#include <time.h>
-#include <string.h>
 
-#define INPUT_NODES 784
-#define HIDDEN_NODES 256
-#define OUTPUT_NODES 10
+#define INPUT_NODES    784
+#define HIDDEN_NODES   128
+#define OUTPUT_NODES   10
+#define NUM_TRAIN      8000
+#define NUM_TEST       1000
+#define BATCH_SIZE     64
+#define EPOCHS         10
 
-#define NUM_TRAINING_IMAGES 8000
-#define NUM_TEST_IMAGES 1000
-#define NUMBER_OF_EPOCHS 10
-#define BATCH_SIZE 128  // Aumentado para melhor eficiência na GPU
+// pesos e vieses
+static double weight1[INPUT_NODES][HIDDEN_NODES];
+static double weight2[HIDDEN_NODES][OUTPUT_NODES];
+static double bias1[HIDDEN_NODES];
+static double bias2[OUTPUT_NODES];
 
-// Arrays globais
-double training_images[NUM_TRAINING_IMAGES][INPUT_NODES];
-double training_labels[NUM_TRAINING_IMAGES][OUTPUT_NODES];
-double test_images[NUM_TEST_IMAGES][INPUT_NODES];
-double test_labels[NUM_TEST_IMAGES][OUTPUT_NODES];
-
-// Parâmetros da rede neural
-double weight1[INPUT_NODES][HIDDEN_NODES];
-double weight2[HIDDEN_NODES][OUTPUT_NODES];
-double bias1[HIDDEN_NODES];
-double bias2[OUTPUT_NODES];
-
-// Estatísticas globais
-int correct_predictions = 0;
-int forward_prob_output = 0;
-
-// Função sigmoid que funciona em CPU e GPU
-#pragma omp declare target
-double sigmoid_safe(double x) {
-    if (x > 10.0) return 1.0;
-    if (x < -10.0) return 0.0;
-    // Usar 1/(1+exp(-x)) de forma segura
-    double exp_neg_x = 1.0;
-    if (x > -10.0 && x < 10.0) {
-        // Aproximação de Taylor para exp(-x) quando x é pequeno
-        double neg_x = -x;
-        exp_neg_x = 1.0 + neg_x + (neg_x * neg_x) / 2.0 +
-                    (neg_x * neg_x * neg_x) / 6.0 +
-                    (neg_x * neg_x * neg_x * neg_x) / 24.0;
-    } else if (x <= -10.0) {
-        exp_neg_x = 1000000.0; // exp(10) aproximadamente
-    } else {
-        exp_neg_x = 0.0001; // exp(-10) aproximadamente
-    }
-    return 1.0 / (1.0 + exp_neg_x);
-}
-
-double relu_safe(double x) {
-    return x > 0.0 ? x : 0.0;
-}
-#pragma omp end declare target
+// dados de treino/teste
+static double (*training_images)[INPUT_NODES];
+static double (*training_labels)[OUTPUT_NODES];
+static double (*test_images)[INPUT_NODES];
+static double (*test_labels)[OUTPUT_NODES];
 
 // Carregar MNIST
 void load_mnist() {
@@ -80,7 +49,7 @@ void load_mnist() {
     }
 
     // Carregar imagens de treino
-    for (int i = 0; i < NUM_TRAINING_IMAGES; i++) {
+    for (int i = 0; i < NUM_TRAIN; i++) {
         for (int j = 0; j < INPUT_NODES; j++) {
             unsigned char pixel;
             fread(&pixel, 1, 1, training_images_file);
@@ -89,7 +58,7 @@ void load_mnist() {
     }
 
     // Carregar labels de treino
-    for (int i = 0; i < NUM_TRAINING_IMAGES; i++) {
+    for (int i = 0; i < NUM_TRAIN; i++) {
         unsigned char label;
         fread(&label, 1, 1, training_labels_file);
         for (int j = 0; j < OUTPUT_NODES; j++) {
@@ -98,7 +67,7 @@ void load_mnist() {
     }
 
     // Carregar imagens de teste
-    for (int i = 0; i < NUM_TEST_IMAGES; i++) {
+    for (int i = 0; i < NUM_TEST; i++) {
         for (int j = 0; j < INPUT_NODES; j++) {
             unsigned char pixel;
             fread(&pixel, 1, 1, test_images_file);
@@ -107,7 +76,7 @@ void load_mnist() {
     }
 
     // Carregar labels de teste
-    for (int i = 0; i < NUM_TEST_IMAGES; i++) {
+    for (int i = 0; i < NUM_TEST; i++) {
         unsigned char label;
         fread(&label, 1, 1, test_labels_file);
         for (int j = 0; j < OUTPUT_NODES; j++) {
@@ -120,327 +89,215 @@ void load_mnist() {
     fclose(test_images_file);
     fclose(test_labels_file);
 }
-// Processa batches inteiros na GPU
-void train_gpu_optimized(int epoch) {
-    double lr = 0.1;
-    if (epoch % 3 == 0 && epoch > 0) {
-        lr *= 0.1;
+
+#pragma omp declare target
+double fast_exp(double x) {
+    x = 1.0 + x / 1024.0;
+    x *= x; x *= x; x *= x; x *= x;
+    x *= x; x *= x; x *= x; x *= x;
+    x *= x; x *= x;
+    return x;
+}
+
+double relu_safe(double x) {
+    return x > 0 ? x : 0;
+}
+
+double sigmoid_safe(double x) {
+    return 1.0 / (1.0 + fast_exp(-x));
+}
+#pragma omp end declare target
+void train_gpu_optimized(int epoch);
+void test_gpu();
+
+int main() {
+    training_images = malloc(NUM_TRAIN * sizeof *training_images);
+    training_labels = malloc(NUM_TRAIN * sizeof *training_labels);
+    test_images     = malloc(NUM_TEST  * sizeof *test_images);
+    test_labels     = malloc(NUM_TEST  * sizeof *test_labels);
+
+    load_mnist();
+
+    srand(123);
+    #pragma omp target enter data map(to: weight1, weight2, bias1, bias2)
+
+    #pragma omp target
+    {
+        // Inicializando weight1 com valores aleatórios
+        #pragma omp teams distribute parallel for collapse(2)
+        for(int input_idx = 0; input_idx < INPUT_NODES; input_idx++) {
+            for(int hidden_idx = 0; hidden_idx < HIDDEN_NODES; hidden_idx++) {
+                weight1[input_idx][hidden_idx] = (rand()/(double)RAND_MAX - 0.5) * 0.1;
+            }
+        }
+
+        // Inicializando bias1 e weight2
+        #pragma omp teams distribute parallel for
+        for(int hidden_idx = 0; hidden_idx < HIDDEN_NODES; hidden_idx++) {
+            bias1[hidden_idx] = 0;
+            for(int output_idx = 0; output_idx < OUTPUT_NODES; output_idx++) {
+                weight2[hidden_idx][output_idx] = (rand()/(double)RAND_MAX - 0.5) * 0.1;
+            }
+        }
+
+        // Inicializando bias2
+        #pragma omp teams distribute parallel for
+        for(int output_idx = 0; output_idx < OUTPUT_NODES; output_idx++) {
+            bias2[output_idx] = 0;
+        }
     }
 
-    int correct_count = 0;
+    // Loop de treinamento
+    double total_start = omp_get_wtime();
+    for(int epoch_idx = 0; epoch_idx < EPOCHS; epoch_idx++) {
+        double epoch_start = omp_get_wtime();
+        train_gpu_optimized(epoch_idx); // Função de treinamento
+        double epoch_end = omp_get_wtime();
+        printf("Época %2d: Tempo = %5.2f seg\n", epoch_idx+1, epoch_end - epoch_start);
+    }
+    double total_end = omp_get_wtime();
+    printf("Tempo total treino: %.2f s\n", total_end - total_start);
 
-    #pragma omp target enter data map(to: weight1[0:INPUT_NODES][0:HIDDEN_NODES], \
-                                         weight2[0:HIDDEN_NODES][0:OUTPUT_NODES], \
-                                         bias1[0:HIDDEN_NODES], \
-                                         bias2[0:OUTPUT_NODES])
+    // Retirando os dados do dispositivo
+    #pragma omp target exit data map(from: weight1, weight2, bias1, bias2)
+    test_gpu();
 
-    for (int batch_start = 0; batch_start < NUM_TRAINING_IMAGES; batch_start += BATCH_SIZE) {
-        int batch_end = batch_start + BATCH_SIZE;
-        if (batch_end > NUM_TRAINING_IMAGES) batch_end = NUM_TRAINING_IMAGES;
-        int current_batch_size = batch_end - batch_start;
+    free(training_images);
+    free(training_labels);
+    free(test_images);
+    free(test_labels);
+    return 0;
+}
 
-        // Arrays para o batch atual
+void train_gpu_optimized(int epoch) {
+    double learning_rate = 0.1 * pow(0.1, epoch/3);
+    int num_batches = (NUM_TRAIN + BATCH_SIZE - 1) / BATCH_SIZE;
+
+    for(int batch_idx = 0; batch_idx < num_batches; batch_idx++) {
+        int start = batch_idx * BATCH_SIZE;
+        int batch_size = (start + BATCH_SIZE > NUM_TRAIN) ? (NUM_TRAIN - start) : BATCH_SIZE;
+
+        double batch_images[BATCH_SIZE][INPUT_NODES];
+        double batch_labels[BATCH_SIZE][OUTPUT_NODES];
+        #pragma omp parallel for simd
+        for(int img = 0; img < batch_size; img++) {
+            memcpy(batch_images[img], training_images[start + img], INPUT_NODES * sizeof(double));
+            memcpy(batch_labels[img], training_labels[start + img], OUTPUT_NODES * sizeof(double));
+        }
+
         double batch_hidden[BATCH_SIZE][HIDDEN_NODES];
         double batch_output[BATCH_SIZE][OUTPUT_NODES];
         double batch_delta_out[BATCH_SIZE][OUTPUT_NODES];
         double batch_delta_hidden[BATCH_SIZE][HIDDEN_NODES];
 
-        double batch_images[BATCH_SIZE][INPUT_NODES];
-        double batch_labels[BATCH_SIZE][OUTPUT_NODES];
-
-        for (int i = 0; i < current_batch_size; i++) {
-            memcpy(batch_images[i], training_images[batch_start + i], INPUT_NODES * sizeof(double));
-            memcpy(batch_labels[i], training_labels[batch_start + i], OUTPUT_NODES * sizeof(double));
+        // FORWARD HIDDEN
+        #pragma omp target teams distribute parallel for collapse(2) map(to: batch_images[0:batch_size][0:INPUT_NODES]) map(from: batch_hidden[0:batch_size][0:HIDDEN_NODES])
+        for(int img = 0; img < batch_size; img++) {
+            for(int hid = 0; hid < HIDDEN_NODES; hid++) {
+                double sum = bias1[hid];
+                for(int inp = 0; inp < INPUT_NODES; inp++) sum += batch_images[img][inp] * weight1[inp][hid];
+                batch_hidden[img][hid] = relu_safe(sum);
+            }
         }
-
-        // FORWARD PASS
-        #pragma omp target teams distribute parallel for collapse(2) \
-                map(to: batch_images[0:current_batch_size][0:INPUT_NODES], \
-                       batch_labels[0:current_batch_size][0:OUTPUT_NODES]) \
-                map(from: batch_hidden[0:current_batch_size][0:HIDDEN_NODES], \
-                         batch_output[0:current_batch_size][0:OUTPUT_NODES])
-        for (int img = 0; img < current_batch_size; img++) {
-            for (int h = 0; h < HIDDEN_NODES; h++) {
-                double sum = bias1[h];
-                for (int i = 0; i < INPUT_NODES; i++) {
-                    sum += batch_images[img][i] * weight1[i][h];
-                }
-                batch_hidden[img][h] = relu_safe(sum);
+        // FORWARD OUTPUT
+        #pragma omp target teams distribute parallel for collapse(2) map(to: batch_hidden[0:batch_size][0:HIDDEN_NODES]) map(from: batch_output[0:batch_size][0:OUTPUT_NODES])
+        for(int img = 0; img < batch_size; img++) {
+            for(int out = 0; out < OUTPUT_NODES; out++) {
+                double sum = bias2[out];
+                for(int hid = 0; hid < HIDDEN_NODES; hid++) sum += batch_hidden[img][hid] * weight2[hid][out];
+                batch_output[img][out] = sigmoid_safe(sum);
             }
         }
 
-        // Segunda camada
-        #pragma omp target teams distribute parallel for collapse(2) \
-                map(to: batch_hidden[0:current_batch_size][0:HIDDEN_NODES]) \
-                map(tofrom: batch_output[0:current_batch_size][0:OUTPUT_NODES])
-        for (int img = 0; img < current_batch_size; img++) {
-            for (int o = 0; o < OUTPUT_NODES; o++) {
-                double sum = bias2[o];
-                for (int h = 0; h < HIDDEN_NODES; h++) {
-                    sum += batch_hidden[img][h] * weight2[h][o];
-                }
-                batch_output[img][o] = sigmoid_safe(sum);
+        // BACKWARD OUTPUT DELTA
+        #pragma omp target teams distribute parallel for collapse(2) map(to: batch_output[0:batch_size][0:OUTPUT_NODES], batch_labels[0:batch_size][0:OUTPUT_NODES]) map(from: batch_delta_out[0:batch_size][0:OUTPUT_NODES])
+        for(int img = 0; img < batch_size; img++) {
+            for(int out = 0; out < OUTPUT_NODES; out++) {
+                double a = batch_output[img][out];
+                batch_delta_out[img][out] = (a - batch_labels[img][out]) * a * (1.0 - a);
+            }
+        }
+        // BACKWARD HIDDEN DELTA
+        #pragma omp target teams distribute parallel for collapse(2) map(to: batch_delta_out[0:batch_size][0:OUTPUT_NODES], batch_hidden[0:batch_size][0:HIDDEN_NODES]) map(from: batch_delta_hidden[0:batch_size][0:HIDDEN_NODES])
+        for(int img = 0; img < batch_size; img++) {
+            for(int hid = 0; hid < HIDDEN_NODES; hid++) {
+                double sum = 0;
+                for(int out = 0; out < OUTPUT_NODES; out++) sum += batch_delta_out[img][out] * weight2[hid][out];
+                batch_delta_hidden[img][hid] = sum * (batch_hidden[img][hid] > 0);
             }
         }
 
-        // Calcular acurácia
-        for (int img = 0; img < current_batch_size; img++) {
-            int pred = 0;
-            double max_val = batch_output[img][0];
-            for (int i = 1; i < OUTPUT_NODES; i++) {
-                if (batch_output[img][i] > max_val) {
-                    max_val = batch_output[img][i];
-                    pred = i;
-                }
-            }
-
-            int label = 0;
-            for (int i = 0; i < OUTPUT_NODES; i++) {
-                if (batch_labels[img][i] == 1.0) {
-                    label = i;
-                    break;
-                }
-            }
-
-            if (pred == label) correct_count++;
-        }
-
-        // BACKWARD PASS
-        #pragma omp target teams distribute parallel for collapse(2) \
-                map(to: batch_output[0:current_batch_size][0:OUTPUT_NODES], \
-                       batch_labels[0:current_batch_size][0:OUTPUT_NODES]) \
-                map(from: batch_delta_out[0:current_batch_size][0:OUTPUT_NODES])
-        for (int img = 0; img < current_batch_size; img++) {
-            for (int o = 0; o < OUTPUT_NODES; o++) {
-                double a = batch_output[img][o];
-                batch_delta_out[img][o] = (a - batch_labels[img][o]) * a * (1.0 - a);
+        // UPDATE weight2 & bias2
+        #pragma omp target teams distribute parallel for collapse(2) map(to: batch_delta_out[0:batch_size][0:OUTPUT_NODES], batch_hidden[0:batch_size][0:HIDDEN_NODES])
+        for(int hid = 0; hid < HIDDEN_NODES; hid++) {
+            for(int out = 0; out < OUTPUT_NODES; out++) {
+                double grad = 0;
+                for(int img = 0; img < batch_size; img++) grad += batch_delta_out[img][out] * batch_hidden[img][hid];
+                weight2[hid][out] -= learning_rate * grad / batch_size;
             }
         }
-
-        // Deltas da camada oculta
-        #pragma omp target teams distribute parallel for collapse(2) \
-                map(to: batch_delta_out[0:current_batch_size][0:OUTPUT_NODES], \
-                       batch_hidden[0:current_batch_size][0:HIDDEN_NODES]) \
-                map(from: batch_delta_hidden[0:current_batch_size][0:HIDDEN_NODES])
-        for (int img = 0; img < current_batch_size; img++) {
-            for (int h = 0; h < HIDDEN_NODES; h++) {
-                double sum = 0.0;
-                for (int o = 0; o < OUTPUT_NODES; o++) {
-                    sum += batch_delta_out[img][o] * weight2[h][o];
-                }
-                batch_delta_hidden[img][h] = sum * (batch_hidden[img][h] > 0.0 ? 1.0 : 0.0);
-            }
+        #pragma omp target teams distribute parallel for map(to: batch_delta_out[0:batch_size][0:OUTPUT_NODES])
+        for(int out = 0; out < OUTPUT_NODES; out++) {
+            double grad = 0;
+            for(int img = 0; img < batch_size; img++) grad += batch_delta_out[img][out];
+            bias2[out] -= learning_rate * grad / batch_size;
         }
 
-        // ATUALIZAÇÃO DE PESOS
-        // Weight2
-        #pragma omp target teams distribute parallel for collapse(2) \
-                map(to: batch_delta_out[0:current_batch_size][0:OUTPUT_NODES], \
-                       batch_hidden[0:current_batch_size][0:HIDDEN_NODES])
-        for (int h = 0; h < HIDDEN_NODES; h++) {
-            for (int o = 0; o < OUTPUT_NODES; o++) {
-                double gradient = 0.0;
-                for (int img = 0; img < current_batch_size; img++) {
-                    gradient += batch_delta_out[img][o] * batch_hidden[img][h];
-                }
-                weight2[h][o] -= lr * gradient / current_batch_size;
+        // UPDATE weight1 & bias1
+        #pragma omp target teams distribute parallel for collapse(2) map(to: batch_delta_hidden[0:batch_size][0:HIDDEN_NODES], batch_images[0:batch_size][0:INPUT_NODES])
+        for(int inp = 0; inp < INPUT_NODES; inp++) {
+            for(int hid = 0; hid < HIDDEN_NODES; hid++) {
+                double grad = 0;
+                for(int img = 0; img < batch_size; img++) grad += batch_delta_hidden[img][hid] * batch_images[img][inp];
+                weight1[inp][hid] -= learning_rate * grad / batch_size;
             }
         }
-
-        // Bias2
-        #pragma omp target teams distribute parallel for \
-                map(to: batch_delta_out[0:current_batch_size][0:OUTPUT_NODES])
-        for (int o = 0; o < OUTPUT_NODES; o++) {
-            double gradient = 0.0;
-            for (int img = 0; img < current_batch_size; img++) {
-                gradient += batch_delta_out[img][o];
-            }
-            bias2[o] -= lr * gradient / current_batch_size;
-        }
-
-        // Weight1
-        #pragma omp target teams distribute parallel for collapse(2) \
-                map(to: batch_delta_hidden[0:current_batch_size][0:HIDDEN_NODES], \
-                       batch_images[0:current_batch_size][0:INPUT_NODES])
-        for (int i = 0; i < INPUT_NODES; i++) {
-            for (int h = 0; h < HIDDEN_NODES; h++) {
-                double gradient = 0.0;
-                for (int img = 0; img < current_batch_size; img++) {
-                    gradient += batch_delta_hidden[img][h] * batch_images[img][i];
-                }
-                weight1[i][h] -= lr * gradient / current_batch_size;
-            }
-        }
-
-        // Bias1
-        #pragma omp target teams distribute parallel for \
-                map(to: batch_delta_hidden[0:current_batch_size][0:HIDDEN_NODES])
-        for (int h = 0; h < HIDDEN_NODES; h++) {
-            double gradient = 0.0;
-            for (int img = 0; img < current_batch_size; img++) {
-                gradient += batch_delta_hidden[img][h];
-            }
-            bias1[h] -= lr * gradient / current_batch_size;
+        #pragma omp target teams distribute parallel for map(to: batch_delta_hidden[0:batch_size][0:HIDDEN_NODES])
+        for(int hid = 0; hid < HIDDEN_NODES; hid++) {
+            double grad = 0;
+            for(int img = 0; img < batch_size; img++) grad += batch_delta_hidden[img][hid];
+            bias1[hid] -= learning_rate * grad / batch_size;
         }
     }
-
-    // Trazer pesos de volta apenas no final da época
-    #pragma omp target exit data map(from: weight1[0:INPUT_NODES][0:HIDDEN_NODES], \
-                                          weight2[0:HIDDEN_NODES][0:OUTPUT_NODES], \
-                                          bias1[0:HIDDEN_NODES], \
-                                          bias2[0:OUTPUT_NODES])
-
-    forward_prob_output = correct_count;
 }
 
-// Versão otimizada do teste
-void test_gpu_optimized() {
-    correct_predictions = 0;
+void test_gpu() {
+    int correct = 0;
 
-    #pragma omp target enter data map(to: weight1[0:INPUT_NODES][0:HIDDEN_NODES], \
-                                         weight2[0:HIDDEN_NODES][0:OUTPUT_NODES], \
-                                         bias1[0:HIDDEN_NODES], \
-                                         bias2[0:OUTPUT_NODES])
+    #pragma omp target map(to: test_images[0:NUM_TEST][0:INPUT_NODES], weight1[0:INPUT_NODES][0:HIDDEN_NODES], bias1[0:HIDDEN_NODES], weight2[0:HIDDEN_NODES][0:OUTPUT_NODES], bias2[0:OUTPUT_NODES], test_labels[0:NUM_TEST][0:OUTPUT_NODES]) map(tofrom: correct)
+    #pragma omp teams distribute parallel for reduction(+:correct)
+    for (int img = 0; img < NUM_TEST; img++) {
+        double hidden[HIDDEN_NODES];
+        double output[OUTPUT_NODES];
 
-    // Processar em batches
-    for (int batch_start = 0; batch_start < NUM_TEST_IMAGES; batch_start += BATCH_SIZE) {
-        int batch_end = batch_start + BATCH_SIZE;
-        if (batch_end > NUM_TEST_IMAGES) batch_end = NUM_TEST_IMAGES;
-        int current_batch_size = batch_end - batch_start;
-
-        double batch_images[BATCH_SIZE][INPUT_NODES];
-        double batch_labels[BATCH_SIZE][OUTPUT_NODES];
-        double batch_output[BATCH_SIZE][OUTPUT_NODES];
-
-        // Copiar batch
-        for (int i = 0; i < current_batch_size; i++) {
-            memcpy(batch_images[i], test_images[batch_start + i], INPUT_NODES * sizeof(double));
-            memcpy(batch_labels[i], test_labels[batch_start + i], OUTPUT_NODES * sizeof(double));
-        }
-
-        // Forward pass completo na GPU
-        #pragma omp target teams distribute parallel for \
-                map(to: batch_images[0:current_batch_size][0:INPUT_NODES]) \
-                map(from: batch_output[0:current_batch_size][0:OUTPUT_NODES])
-        for (int img = 0; img < current_batch_size; img++) {
-            // Camada oculta
-            double hidden[HIDDEN_NODES];
-            for (int h = 0; h < HIDDEN_NODES; h++) {
-                double sum = bias1[h];
-                for (int i = 0; i < INPUT_NODES; i++) {
-                    sum += batch_images[img][i] * weight1[i][h];
-                }
-                hidden[h] = relu_safe(sum);
+        for (int hid = 0; hid < HIDDEN_NODES; hid++) {
+            double sum = bias1[hid];
+            for (int inp = 0; inp < INPUT_NODES; inp++) {
+                sum += test_images[img][inp] * weight1[inp][hid];
             }
+            hidden[hid] = relu_safe(sum);
+        }
 
-            // Camada de saída
-            for (int o = 0; o < OUTPUT_NODES; o++) {
-                double sum = bias2[o];
-                for (int h = 0; h < HIDDEN_NODES; h++) {
-                    sum += hidden[h] * weight2[h][o];
-                }
-                batch_output[img][o] = sigmoid_safe(sum);
+        for (int out = 0; out < OUTPUT_NODES; out++) {
+            double sum = bias2[out];
+            for (int hid = 0; hid < HIDDEN_NODES; hid++) {
+                sum += hidden[hid] * weight2[hid][out];
             }
+            output[out] = sigmoid_safe(sum);
         }
 
-        // Calcular acurácia (CPU)
-        for (int img = 0; img < current_batch_size; img++) {
-            int pred = 0;
-            double max_val = batch_output[img][0];
-            for (int i = 1; i < OUTPUT_NODES; i++) {
-                if (batch_output[img][i] > max_val) {
-                    max_val = batch_output[img][i];
-                    pred = i;
-                }
-            }
-
-            int label = 0;
-            for (int i = 0; i < OUTPUT_NODES; i++) {
-                if (batch_labels[img][i] == 1.0) {
-                    label = i;
-                    break;
-                }
-            }
-
-            if (pred == label) correct_predictions++;
+        int pred = 0;
+        for (int out = 1; out < OUTPUT_NODES; out++) {
+            if (output[out] > output[pred]) pred = out;
         }
-    }
 
-    // Liberar dados da GPU
-    #pragma omp target exit data map(delete: weight1[0:INPUT_NODES][0:HIDDEN_NODES], \
-                                            weight2[0:HIDDEN_NODES][0:OUTPUT_NODES], \
-                                            bias1[0:HIDDEN_NODES], \
-                                            bias2[0:OUTPUT_NODES])
-}
-int main() {
-    printf("Rede Neural: %d -> %d -> %d\n", INPUT_NODES, HIDDEN_NODES, OUTPUT_NODES);
-    printf("Batch Size: %d\n", BATCH_SIZE);
-
-    srand(42);
-
-    double xavier_std1 = sqrt(2.0 / (INPUT_NODES + HIDDEN_NODES));
-    for (int i = 0; i < INPUT_NODES; i++) {
-        for (int j = 0; j < HIDDEN_NODES; j++) {
-            weight1[i][j] = ((double)rand() / RAND_MAX * 2.0 - 1.0) * xavier_std1;
+        int act = 0;
+        for (int out = 0; out < OUTPUT_NODES; out++) {
+            if (test_labels[img][out] == 1.0) act = out;
         }
+
+        if (pred == act) correct++;
     }
 
-    double xavier_std2 = sqrt(2.0 / (HIDDEN_NODES + OUTPUT_NODES));
-    for (int i = 0; i < HIDDEN_NODES; i++) {
-        bias1[i] = 0.01; // Pequeno bias positivo para ReLU
-        for (int j = 0; j < OUTPUT_NODES; j++) {
-            weight2[i][j] = ((double)rand() / RAND_MAX * 2.0 - 1.0) * xavier_std2;
-        }
-    }
-
-    // Bias inicializado com zeros
-    for (int i = 0; i < OUTPUT_NODES; i++) {
-        bias2[i] = 0.0;
-    }
-
-    // Carregar dados
-    printf("Carregando dataset MNIST...\n");
-    load_mnist();
-
-    // Treinar
-    printf("Learning rate: 0.1 (*0.1 a cada 3 épocas)\n");
-    printf("Processamento em batches de %d imagens\n", BATCH_SIZE);
-
-    clock_t total_start = clock();
-
-    for (int epoch = 0; epoch < NUMBER_OF_EPOCHS; epoch++) {
-        clock_t epoch_start = clock();
-
-        train_gpu_optimized(epoch);
-
-        clock_t epoch_end = clock();
-        double epoch_time = (double)(epoch_end - epoch_start) / CLOCKS_PER_SEC;
-        double accuracy = (double)forward_prob_output / NUM_TRAINING_IMAGES * 100.0;
-
-        printf("Época %2d: Acurácia = %6.2f%% | Tempo = %5.2f seg\n",
-               epoch + 1, accuracy, epoch_time);
-
-    }
-
-    clock_t total_end = clock();
-    double total_time = (double)(total_end - total_start) / CLOCKS_PER_SEC;
-
-    printf("Tempo total: %.2f segundos (%.2f seg/época)\n",
-           total_time, total_time / NUMBER_OF_EPOCHS);
-
-    // Testar
-    printf("Executando teste final...\n");
-    clock_t test_start = clock();
-
-    test_gpu_optimized();
-
-    clock_t test_end = clock();
-    double test_time = (double)(test_end - test_start) / CLOCKS_PER_SEC;
-
-    double test_accuracy = (double)correct_predictions / NUM_TEST_IMAGES * 100.0;
-
-    printf("Acurácia de teste: %.2f%%\n", test_accuracy);
-    printf("Tempo de teste: %.3f segundos\n", test_time);
-
-    return 0;
+    printf("Accuracy teste: %.2f%%\n", correct * 100.0 / NUM_TEST);
 }
