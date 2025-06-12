@@ -118,6 +118,8 @@ int main() {
 
     load_mnist();
 
+    omp_set_num_threads(4);
+
     srand(123);
     #pragma omp target enter data map(to: weight1, weight2, bias1, bias2)
 
